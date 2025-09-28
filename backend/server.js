@@ -1,54 +1,28 @@
 const express = require('express');
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs-extra');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
+const admin = require('firebase-admin');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const UPLOAD_PATH = '/mnt/disk/uploads';
 const MAX_TOTAL_SIZE = 500 * 1024 * 1024; // 500MB
+
+// Initialize Firebase Admin SDK
+const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS || '{}');
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+  storageBucket: 'drone-catalog.appspot.com' // Replace with your project's bucket (from Firebase Console > Storage)
+});
+const bucket = admin.storage().bucket();
 
 // Middleware
 app.use(cors());
 app.use(express.json());
-app.use('/uploads', express.static(UPLOAD_PATH));
 
-// Ensure upload directory exists
-fs.ensureDirSync(UPLOAD_PATH);
-
-// In-memory metadata (for simplicity; use a DB like PostgreSQL for production)
-let mediaFiles = [];
-
-// Function to get total directory size
-async function getDirSize(dir) {
-  let total = 0;
-  const files = await fs.readdir(dir, { withFileTypes: true });
-  for (const file of files) {
-    const filePath = path.join(dir, file.name);
-    if (file.isDirectory()) {
-      total += await getDirSize(filePath);
-    } else {
-      total += (await fs.stat(filePath)).size;
-    }
-  }
-  return total;
-}
-
-// Multer storage
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, UPLOAD_PATH);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${uuidv4()}${ext}`);
-  }
-});
-
+// Multer for in-memory storage (before upload to Firebase)
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 100 * 1024 * 1024 }, // 100MB per file
   fileFilter: (req, file, cb) => {
     const allowedTypes = ['image/jpeg', 'image/png', 'video/mp4', 'video/webm', 'audio/mpeg', 'audio/wav'];
@@ -60,9 +34,47 @@ const upload = multer({
   }
 });
 
+// In-memory metadata (use Firestore for production persistence)
+let mediaFiles = [];
+
+// Calculate total size from Firebase (async)
+async function getTotalSize() {
+  let total = 0;
+  try {
+    const [files] = await bucket.getFiles({ prefix: 'media/' });
+    for (const file of files) {
+      const [metadata] = await file.getMetadata();
+      total += parseInt(metadata.size, 10);
+    }
+  } catch (err) {
+    console.error('Error calculating total size:', err);
+  }
+  return total;
+}
+
 // Routes
-app.get('/api/media', (req, res) => {
-  res.json(mediaFiles);
+app.get('/api/media', async (req, res) => {
+  // Fetch metadata from Firebase Storage
+  try {
+    const [files] = await bucket.getFiles({ prefix: 'media/' });
+    mediaFiles = [];
+    for (const file of files) {
+      const [metadata] = await file.getMetadata();
+      const fileName = metadata.name.split('/').pop();
+      mediaFiles.push({
+        id: uuidv4(), // Generate client-side compatible ID
+        name: fileName,
+        type: metadata.contentType,
+        url: `https://storage.googleapis.com/${bucket.name}/${metadata.name}?alt=media`, // Public URL
+        platformId: null, // Default; update via PUT
+        isThumbnail: false // Default; update via PUT
+      });
+    }
+    res.json(mediaFiles);
+  } catch (err) {
+    console.error('Error fetching media:', err);
+    res.status(500).json({ error: 'Failed to fetch media' });
+  }
 });
 
 app.post('/api/media', upload.single('file'), async (req, res) => {
@@ -71,23 +83,35 @@ app.post('/api/media', upload.single('file'), async (req, res) => {
   }
 
   // Check total size
-  const currentSize = await getDirSize(UPLOAD_PATH);
+  const currentSize = await getTotalSize();
   const newSize = currentSize + req.file.size;
   if (newSize > MAX_TOTAL_SIZE) {
-    await fs.unlink(path.join(UPLOAD_PATH, req.file.filename));
     return res.status(413).json({ error: 'Total storage capacity exceeded (500MB limit)' });
   }
 
-  const newFile = {
-    id: uuidv4(),
-    name: req.body.name || req.file.originalname,
-    type: req.file.mimetype,
-    url: `/uploads/${req.file.filename}`,
-    platformId: req.body.platformId || null,
-    isThumbnail: req.body.isThumbnail === 'true'
-  };
-  mediaFiles.push(newFile);
-  res.json(newFile);
+  try {
+    const fileName = `media/${uuidv4()}${path.extname(req.file.originalname)}`;
+    const file = bucket.file(fileName);
+    await file.save(req.file.buffer, {
+      metadata: { contentType: req.file.mimetype }
+    });
+    await file.makePublic(); // Make accessible via URL
+
+    const [metadata] = await file.getMetadata();
+    const newFile = {
+      id: uuidv4(),
+      name: req.body.name || req.file.originalname,
+      type: req.file.mimetype,
+      url: metadata.mediaLink, // Public URL from Firebase
+      platformId: req.body.platformId || null,
+      isThumbnail: req.body.isThumbnail === 'true'
+    };
+    mediaFiles.push(newFile); // Cache locally
+    res.json(newFile);
+  } catch (err) {
+    console.error('Error uploading to Firebase:', err);
+    res.status(500).json({ error: 'Failed to upload file' });
+  }
 });
 
 app.put('/api/media/:id', async (req, res) => {
@@ -117,15 +141,18 @@ app.put('/api/media/:id', async (req, res) => {
 
 app.delete('/api/media/:id', async (req, res) => {
   const { id } = req.params;
-  const file = mediaFiles.find(f => f.id === id);
-  if (!file) {
+  const fileIndex = mediaFiles.findIndex(f => f.id === id);
+  if (fileIndex === -1) {
     return res.status(404).json({ error: 'File not found' });
   }
   try {
-    await fs.unlink(path.join(UPLOAD_PATH, path.basename(file.url)));
-    mediaFiles = mediaFiles.filter(f => f.id !== id);
+    // Extract Firebase path from URL (e.g., /media/uuid.ext)
+    const firebasePath = mediaFiles[fileIndex].url.split(bucket.name + '/')[1].split('?')[0];
+    await bucket.file(firebasePath).delete();
+    mediaFiles.splice(fileIndex, 1);
     res.json({ message: 'File deleted' });
   } catch (err) {
+    console.error('Error deleting from Firebase:', err);
     res.status(500).json({ error: 'Failed to delete file' });
   }
 });
